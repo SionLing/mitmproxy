@@ -20,6 +20,7 @@ mitmproxy/contrib/kaitaistruct/**/*.ksy
 __pycache__
 .hypothesis/
 .hugo_build.lock
+recorder/traffic.db*
 
 # UI
 
