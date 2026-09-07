@@ -1,6 +1,7 @@
 import time
 
 import pytest
+from mcp_server import clear_flows
 from mcp_server import domain_stats
 from mcp_server import get_flow
 from mcp_server import list_flows
@@ -94,3 +95,35 @@ class TestSearchFlows:
 
     def test_no_match(self, db):
         assert search_flows(db, "nonexistent-token") == []
+
+
+class TestClearFlows:
+    def test_clear_all(self, db):
+        result = clear_flows(db)
+        assert result["deleted"] == 3
+        assert list_flows(db, since_seconds=999999) == []
+
+    def test_clear_by_host_includes_subdomains(self, db):
+        result = clear_flows(db, host="example.com")
+        assert result["deleted"] == 2
+        remaining = list_flows(db, since_seconds=999999)
+        assert [r["host"] for r in remaining] == ["api.other.org"]
+
+    def test_clear_by_age(self, db):
+        # Fixture flows are all ~10s old; nothing older than an hour.
+        assert clear_flows(db, older_than_seconds=3600)["deleted"] == 0
+        assert clear_flows(db, older_than_seconds=0)["deleted"] == 3
+
+    def test_clear_empty_db(self, db):
+        clear_flows(db)
+        assert clear_flows(db)["deleted"] == 0
+
+
+class TestCaptureGuide:
+    def test_guide_covers_wireguard_and_endpoint_fix(self):
+        from mcp_server import CAPTURE_GUIDE
+
+        assert "--wireguard" in CAPTURE_GUIDE
+        assert "--mode regular --mode wireguard" in CAPTURE_GUIDE
+        assert "Endpoint" in CAPTURE_GUIDE and "51820" in CAPTURE_GUIDE
+        assert "mitm.it" in CAPTURE_GUIDE
