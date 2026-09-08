@@ -147,7 +147,7 @@ uv run mitmweb --mode regular --mode wireguard -s recorder/traffic_recorder.py
 2. 安装 **WireGuard** App
 3. 打开 mitmweb 界面（启动日志中带 token 的 `http://127.0.0.1:8081/?token=...`），在 WireGuard 模式卡片上找到**二维码**
 4. WireGuard App → 添加隧道 → 扫描二维码（Tunnel name 随便填，只是本地显示名）
-5. **必须手动修正 Endpoint**：若 Mac 开着 VPN，mitmproxy 会把 Endpoint 误识别为 VPN 隧道 IP。在 WireGuard App 里编辑该隧道，把 Endpoint 改为 **Mac 局域网 IP + 51820**（如 `192.168.1.163:51820`），保存并启用
+5. 启用隧道即可。`capture.sh start --wireguard` 已把 Endpoint 固定为 en0 的局域网 IP（`--mode wireguard@<IP>:51820`），开 VPN 也不会识别错；**若用方式二手动启动**，开了 VPN 时二维码里的 Endpoint 会被误识别为 VPN 隧道 IP，需在 WireGuard App 里手动改成 **Mac 局域网 IP + 51820**（如 `192.168.1.163:51820`）
 
 验证手机已接入：
 
@@ -159,6 +159,8 @@ sqlite3 recorder/traffic.db \
 手机上随便操作，几秒后应出现新记录。
 
 **用完记得切回**：WireGuard 模式下手机所有流量走 Mac → VPN 出口，视频 App 会明显变慢。分析完毕后停掉（`pkill mitmweb`），日常抓包用 `recorder/capture.sh start --phone`。
+
+**图片裂图（不信任 mitm CA 的加载器）**：WireGuard 模式强制解密全量流量，但 Flutter 的图片加载器（dart:io）使用自带证书库，不信任 mitm CA，TLS 握手直接失败（日志刷屏 `Client TLS handshake failed ... uploaded.good-videos.org`），图片全裂。修法：Web UI → Options → 搜索 `ignore_hosts`，添加对应域名（如 `uploaded.good-videos.org`）。mitm 对该域名只做 TCP 透传不解密，手机直连源站（Cloudflare），证书合法，图片恢复；走 Cronet/okhttp 且信任用户 CA 的业务 API、广告 SDK 不受影响，照抓。
 
 ## 5. 启动采集
 
@@ -326,6 +328,9 @@ addon 每次启动时清理 7 天前的记录；大 body 已截断到 256KB。
 
 **Q: 手机浏览器访问 mitmproxy.it 显示 502？**
 本版本的内置证书安装页域名是 `mitm.it`（短域名）。`mitmproxy.it` 会被当作真实网站转发到上游导致 502。手机浏览器应访问 `http://mitm.it`。
+
+**Q: WireGuard 模式下 App 内图片全部裂图（如 Cloudflare 裁剪图 `uploaded.good-videos.org`）？**
+该 App 的图片加载器（Flutter dart:io）使用自带证书库，不信任 mitm CA，被强制解密后 TLS 握手失败。之前手动代理模式下正常，是因为 dart:io 默认不走系统代理、图片是直连出去的。修法：Options → `ignore_hosts` 添加该图片域名，mitm 只做 TCP 透传不解密即可恢复，详见第 4.2 节。
 
 ## 测试与维护
 

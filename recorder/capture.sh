@@ -73,10 +73,20 @@ start_wireguard() {
     echo "already running (pid $(cat "$PIDFILE"))"
     return
   fi
+  # Pin WireGuard to the physical LAN IP: when a VPN (Clash TUN etc.) holds the
+  # default route, mitmproxy's auto-detected Endpoint is the VPN tunnel IP and
+  # phones can't reach it. wireguard@IP:51820 fixes both binding and QR config.
+  local ip wg_mode
+  ip=$(ipconfig getifaddr en0 2>/dev/null || true)
+  if [[ -n "$ip" ]]; then
+    wg_mode="wireguard@$ip:51820"
+  else
+    wg_mode="wireguard"
+  fi
   # Do NOT pass -p here: it becomes the default port for every mode,
   # so WireGuard would grab 8080 and the regular proxy would never start.
   PYTHONUNBUFFERED=1 nohup uv run --project "$PROJECT" mitmweb \
-    --mode regular --mode wireguard \
+    --mode regular --mode "$wg_mode" \
     -s "$PROJECT/recorder/traffic_recorder.py" \
     >"$LOG" 2>&1 &
   echo $! >"$PIDFILE"
@@ -85,14 +95,16 @@ start_wireguard() {
     echo "failed to start, see $LOG" >&2
     exit 1
   fi
-  local ip
-  ip=$(ipconfig getifaddr en0 2>/dev/null || echo "<Mac 的局域网 IP>")
-  echo "mitmweb started (pid $(cat "$PIDFILE"), regular :$PORT, wireguard :51820, log: $LOG)"
+  echo "mitmweb started (pid $(cat "$PIDFILE"), regular :$PORT, wireguard $wg_mode, log: $LOG)"
   echo "web ui: $(grep -o 'http://127.0.0.1:8081/?token=[a-f0-9]*' "$LOG" | head -1)"
   echo ""
   echo "==> 手机设置：关闭 Wi-Fi 手动代理（与 WireGuard 模式互斥）"
   echo "==> 手机 WireGuard App 扫描 Web UI 里的二维码导入隧道"
-  echo "==> 导入后手动把 Endpoint 改成 $ip:51820（开了 VPN 时扫码自带的是错的隧道 IP）"
+  if [[ -n "$ip" ]]; then
+    echo "==> Endpoint 已固定为 $ip:51820，扫码导入即可，无需手改"
+  else
+    echo "==> 未能检测 en0 IP，导入后手动把 Endpoint 改成 <Mac 的局域网 IP>:51820"
+  fi
 }
 
 stop() {
