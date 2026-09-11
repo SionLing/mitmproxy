@@ -307,6 +307,43 @@ def test_serialize_defaults():
     assert buf.getvalue()
 
 
+def test_save_keys(tmp_path):
+    dst = tmp_path / "config.yaml"
+    dst.write_text("four: fromfile\nunrelated: keep\n")
+
+    o = TD2()
+    o.three = "set"
+    o.four = "settoo"
+    optmanager.save_keys(o, dst, ["three"])
+
+    # Only the given key is written; other changed options and existing
+    # content are left alone.
+    data = dst.read_text()
+    assert "three: set" in data
+    assert "fromfile" in data
+    assert "unrelated: keep" in data
+
+    # Resetting an option to its default removes it from the file.
+    o.three = "dthree"
+    optmanager.save_keys(o, dst, ["three"])
+    assert "three" not in dst.read_text()
+
+    # Unknown keys are ignored.
+    optmanager.save_keys(o, dst, ["unknown_option"])
+    assert "unknown_option" not in dst.read_text()
+
+    # The file is created if it does not exist yet.
+    dst2 = tmp_path / "sub" / "config.yaml"
+    o.three = "set"
+    optmanager.save_keys(o, dst2, ["three"])
+    assert "three: set" in dst2.read_text()
+
+    # Corrupt existing data raises OptionsError.
+    dst.write_bytes(b"\xff\xff\xff")
+    with pytest.raises(exceptions.OptionsError):
+        optmanager.save_keys(o, dst, ["three"])
+
+
 def test_saving(tmpdir):
     o = TD2()
     o.three = "set"

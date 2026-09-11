@@ -221,6 +221,11 @@ class APIError(tornado.web.HTTPError):
     pass
 
 
+def _config_path(opts) -> str:
+    """Where mitmproxy loads its config file from (see tools/main.py)."""
+    return os.path.join(os.path.expanduser(opts.confdir), "config.yaml")
+
+
 class AuthRequestHandler(tornado.web.RequestHandler):
     AUTH_COOKIE_VALUE = b"y"
 
@@ -276,6 +281,15 @@ class AuthRequestHandler(tornado.web.RequestHandler):
             self.get_signed_cookie(self.settings["auth_cookie_name"](), min_version=2)
             == self.AUTH_COOKIE_VALUE
         )
+
+    def check_xsrf_cookie(self) -> None:
+        # API clients authenticating with a Bearer token cannot be forged
+        # cross-site (the token is unknown to other origins), so the XSRF
+        # double-submit cookie dance is unnecessary for them. Cookie-based
+        # browser sessions still go through the normal check.
+        if self.request.headers.get("Authorization", "").startswith("Bearer "):
+            return
+        super().check_xsrf_cookie()
 
 
 class RequestHandler(AuthRequestHandler):
@@ -812,15 +826,23 @@ class Options(RequestHandler):
             self.master.options.update(**update)
         except Exception as err:
             raise APIError(400, f"{err}")
+        # Persist UI edits so they survive restarts. Unlike optmanager.save(),
+        # this only touches the keys that were just changed, so options passed
+        # on the command line (e.g. --mode) don't leak into the config file.
+        try:
+            optmanager.save_keys(
+                self.master.options, _config_path(self.master.options), update.keys()
+            )
+        except Exception as err:
+            logging.error(f"Failed to persist options to config file: {err}")
 
 
 class SaveOptions(RequestHandler):
     def post(self):
-        # try:
-        #     optmanager.save(self.master.options, CONFIG_PATH, True)
-        # except Exception as err:
-        #     raise APIError(400, "{}".format(err))
-        pass
+        try:
+            optmanager.save(self.master.options, _config_path(self.master.options))
+        except Exception as err:
+            raise APIError(400, f"{err}")
 
 
 class State(RequestHandler):

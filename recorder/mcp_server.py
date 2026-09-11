@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["mcp>=1.2"]
+# dependencies = ["mcp>=1.2", "ruamel.yaml"]
 # ///
 """
 MCP server exposing the traffic.db recorded by traffic_recorder.py to Claude Code.
@@ -13,19 +13,31 @@ Register with Claude Code (project scope):
         /Users/sion/projects/mitmproxy/recorder/mcp_server.py
 
 Configuration via environment:
-    TRAFFIC_DB   path to traffic.db (default: recorder/traffic.db next to this file)
+    TRAFFIC_DB        path to traffic.db (default: recorder/traffic.db next to this file)
+    MITMPROXY_CONFIG  path to config.yaml holding the block_list option
+                      (default: ~/.mitmproxy/config.yaml)
+    MITMWEB_API       mitmweb API base URL used to apply block_list changes live
+                      (default: http://127.0.0.1:8081)
 
 The query functions below take an explicit db_path and never import mcp,
 so they can be unit-tested inside the project environment (which has no mcp).
 """
 
+import json
 import os
+import re
 import sqlite3
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
+import ruamel.yaml
+
 DEFAULT_DB = str(Path(__file__).parent / "traffic.db")
+DEFAULT_CONFIG = str(Path("~/.mitmproxy").expanduser() / "config.yaml")
+DEFAULT_API = "http://127.0.0.1:8081"
+CAPTURE_LOG = "/tmp/traffic_recorder_mitmdump.log"
 
 FLOW_COLUMNS = (
     "id, ts, duration_ms, method, scheme, host, port, path, status,"
@@ -170,6 +182,181 @@ def clear_flows(
         conn.close()
 
 
+def _normalize_domain(domain: str) -> str:
+    """Accept bare domains, '*.example.com' or full URLs; return a bare domain."""
+    domain = domain.strip().lower().removeprefix("*.")
+    if "://" in domain:
+        domain = domain.split("://", 1)[1]
+    domain = domain.split("/", 1)[0].split(":", 1)[0]
+    if not domain:
+        raise ValueError("empty domain")
+    return domain
+
+
+def make_block_entry(domain: str, status: int = 403) -> str:
+    """Build a block_list option entry ('/flow-filter/status') matching the
+    domain and its subdomains. The filter regex must be quoted — mitmproxy's
+    filter grammar disallows parens in bare words — and dots use character
+    classes to dodge backslash-escaping across the filter and YAML layers."""
+    regex = "(^|[.])" + domain.replace(".", "[.]") + "$"
+    return f"/~d '{regex}'/{status}"
+
+
+_ENTRY_RE = re.compile(r"/~d '\(\^\|\[\.\]\)(?P<domain>.+?)\$'/(?P<status>\d+)$")
+
+
+def parse_block_entry(entry: str) -> dict[str, Any] | None:
+    """Parse an entry produced by make_block_entry back into domain + status.
+    Returns None for entries written by hand with other filters."""
+    m = _ENTRY_RE.fullmatch(entry)
+    if not m:
+        return None
+    return {
+        "domain": m.group("domain").replace("[.]", "."),
+        "status": int(m.group("status")),
+    }
+
+
+def load_config(config_path: str) -> dict[str, Any]:
+    p = Path(config_path).expanduser()
+    if not p.exists():
+        return {}
+    data = ruamel.yaml.YAML(typ="safe", pure=True).load(p.read_text(encoding="utf8"))
+    return data or {}
+
+
+def save_config(config_path: str, config: dict[str, Any]) -> None:
+    p = Path(config_path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf8") as f:
+        ruamel.yaml.YAML().dump(config, f)
+
+
+def discover_token(config: dict[str, Any], log_path: str = CAPTURE_LOG) -> str | None:
+    """Auth token for the mitmweb API: the fixed `web_password` option if set,
+    otherwise the random per-boot token from the capture log."""
+    pw = config.get("web_password")
+    if pw and not str(pw).startswith("$"):  # argon2 hashes are unusable as tokens
+        return str(pw)
+    p = Path(log_path)
+    if p.exists():
+        tokens = re.findall(r"\?token=([0-9a-f]{32,})", p.read_text(errors="replace"))
+        if tokens:
+            return tokens[-1]
+    return None
+
+
+def _api_request(
+    api_url: str, token: str, method: str, path: str, payload: Any = None
+) -> Any:
+    req = urllib.request.Request(
+        f"{api_url}{path}",
+        method=method,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        body = resp.read().decode()
+        return json.loads(body) if body else None
+
+
+def _live_entries(api_url: str | None, token: str | None) -> list[str] | None:
+    """Current block_list from a running mitmweb, or None if unreachable."""
+    if not api_url or not token:
+        return None
+    try:
+        opts = _api_request(api_url, token, "GET", "/options")
+        return list(opts["block_list"]["value"] or [])
+    except Exception:
+        return None
+
+
+def _read_entries(
+    config_path: str, api_url: str | None, token: str | None
+) -> tuple[dict[str, Any], list[str], bool]:
+    """(config, current block_list entries, live?) — live state wins when
+    mitmweb is reachable, otherwise fall back to the config file."""
+    config = load_config(config_path)
+    entries = _live_entries(api_url, token)
+    if entries is not None:
+        return config, entries, True
+    return config, list(config.get("block_list") or []), False
+
+
+def _write_entries(
+    config_path: str,
+    config: dict[str, Any],
+    entries: list[str],
+    live: bool,
+    api_url: str | None,
+    token: str | None,
+) -> str:
+    if live:
+        try:
+            # mitmweb's Options.put persists the change to the config file.
+            _api_request(api_url, token, "PUT", "/options", {"block_list": entries})
+            return "mitmweb (effective immediately + saved to config)"
+        except Exception:
+            pass
+    if entries:
+        config["block_list"] = entries
+    else:
+        config.pop("block_list", None)
+    save_config(config_path, config)
+    return "config file (takes effect on next mitmproxy start)"
+
+
+def block_domain(
+    config_path: str,
+    domain: str,
+    status: int = 403,
+    api_url: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """Add a domain to the block_list option. Subdomains are blocked too."""
+    domain = _normalize_domain(domain)
+    config, entries, live = _read_entries(config_path, api_url, token)
+    for e in entries:
+        parsed = parse_block_entry(e)
+        if parsed and parsed["domain"] == domain:
+            return {"domain": domain, "added": False, "entry": e}
+    entry = make_block_entry(domain, status)
+    persisted = _write_entries(
+        config_path, config, entries + [entry], live, api_url, token
+    )
+    return {"domain": domain, "added": True, "entry": entry, "persisted": persisted}
+
+
+def list_blocked(
+    config_path: str, api_url: str | None = None, token: str | None = None
+) -> list[dict[str, Any]]:
+    """List the current block_list entries. Entries created via block_domain
+    are returned as {domain, status}; hand-written filters as {raw}."""
+    _, entries, _ = _read_entries(config_path, api_url, token)
+    return [p if (p := parse_block_entry(e)) else {"raw": e} for e in entries]
+
+
+def unblock_domain(
+    config_path: str,
+    domain: str,
+    api_url: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """Remove a domain from the block_list option."""
+    domain = _normalize_domain(domain)
+    config, entries, live = _read_entries(config_path, api_url, token)
+    kept = [
+        e for e in entries if not (p := parse_block_entry(e)) or p["domain"] != domain
+    ]
+    if len(kept) == len(entries):
+        return {"domain": domain, "removed": False}
+    persisted = _write_entries(config_path, config, kept, live, api_url, token)
+    return {"domain": domain, "removed": True, "persisted": persisted}
+
+
 CAPTURE_GUIDE = """\
 # mitmproxy 流量采集操作指南
 
@@ -220,10 +407,23 @@ def create_server():
     from mcp.server.mcpserver import MCPServer
 
     db_path = os.environ.get("TRAFFIC_DB", DEFAULT_DB)
+    config_path = os.environ.get("MITMPROXY_CONFIG", DEFAULT_CONFIG)
+    api_url = os.environ.get("MITMWEB_API", DEFAULT_API)
+
+    def current_token() -> str | None:
+        # Resolved per call: mitmweb generates a fresh random token on every
+        # restart unless web_password is set, and the latest one lands in the
+        # capture log.
+        return discover_token(load_config(config_path))
+
     mcp = MCPServer(
         "traffic-recorder",
         instructions=(
-            "Query and analyze HTTP traffic captured by mitmproxy into SQLite. "
+            "Query and analyze HTTP traffic captured by mitmproxy into SQLite, "
+            "and manage mitmproxy's block_list option (blocked requests get an "
+            "immediate 403 and never reach the server). Blocklist changes apply "
+            "live when mitmweb is running and are always persisted to config.yaml; "
+            "the same list is visible in the mitmweb Options UI. "
             "If the database is empty or stale, the capture may not be running — "
             "call the capture_guide tool for how to start it (regular / phone / wireguard modes), "
             "including how to fix the WireGuard Endpoint IP when the Mac runs a VPN."
@@ -265,6 +465,21 @@ def create_server():
     ) -> dict[str, Any]:
         """Delete recorded flows. DESTRUCTIVE: with no filters this wipes the whole database. Optionally restrict by domain or age."""
         return clear_flows(db_path, host, older_than_seconds)
+
+    @mcp.tool(name="block_domain")
+    def tool_block_domain(domain: str, status: int = 403) -> dict[str, Any]:
+        """Add a domain to mitmproxy's block_list option; every request to it (subdomains included) gets an empty response with the given status (444 closes the connection). Applies live when mitmweb runs, always persisted to config.yaml. Accepts 'example.com', '*.example.com' or a URL."""
+        return block_domain(config_path, domain, status, api_url, current_token())
+
+    @mcp.tool(name="list_blocked")
+    def tool_list_blocked() -> list[dict[str, Any]]:
+        """List mitmproxy's current block_list entries: {domain, status} for entries added via block_domain, {raw} for hand-written filters."""
+        return list_blocked(config_path, api_url, current_token())
+
+    @mcp.tool(name="unblock_domain")
+    def tool_unblock_domain(domain: str) -> dict[str, Any]:
+        """Remove a domain from mitmproxy's block_list option. Applies live when mitmweb runs, always persisted."""
+        return unblock_domain(config_path, domain, api_url, current_token())
 
     @mcp.tool(name="capture_guide")
     def tool_capture_guide() -> str:

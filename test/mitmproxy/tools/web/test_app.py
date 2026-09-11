@@ -2,6 +2,7 @@ import gzip
 import importlib
 import json
 import logging
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -56,6 +57,9 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
     def get_app(self):
         async def make_master() -> webmaster.WebMaster:
             o = options.Options(http2=False)
+            # Option edits via the API are persisted to confdir/config.yaml;
+            # keep tests away from the developer's real config.
+            o.confdir = tempfile.mkdtemp()
             return webmaster.WebMaster(o, with_termlog=False)
 
         m: webmaster.WebMaster = self.io_loop.asyncio_loop.run_until_complete(
@@ -419,8 +423,19 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
         assert self.put_json("/options", {"wtf": True}).code == 400
         assert self.put_json("/options", {"anticache": "foo"}).code == 400
 
+    def test_option_update_is_persisted(self):
+        assert self.put_json("/options", {"anticache": True}).code == 200
+        config = Path(self.master.options.confdir) / "config.yaml"
+        assert "anticache: true" in config.read_text()
+        # Resetting to the default removes the key from the config file again.
+        assert self.put_json("/options", {"anticache": False}).code == 200
+        assert "anticache" not in config.read_text()
+
     def test_option_save(self):
+        assert self.put_json("/options", {"anticache": True}).code == 200
         assert self.fetch("/options/save", method="POST").code == 200
+        config = Path(self.master.options.confdir) / "config.yaml"
+        assert "anticache: true" in config.read_text()
 
     def test_err(self):
         with mock.patch("mitmproxy.tools.web.app.IndexHandler.get") as f:
@@ -634,3 +649,49 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             assert self._app.settings["auth_cookie_name"]().endswith(str(new_port))
         finally:
             opts.web_port = old_port
+
+
+@pytest.mark.usefixtures("no_tornado_logging", "tdata")
+class TestXsrf(tornado.testing.AsyncHTTPTestCase):
+    """XSRF protection stays on for cookie-based browser sessions, but API
+    clients authenticating with a Bearer token are exempt."""
+
+    def get_app(self):
+        async def make_master() -> webmaster.WebMaster:
+            o = options.Options(http2=False)
+            o.confdir = tempfile.mkdtemp()
+            return webmaster.WebMaster(o, with_termlog=False)
+
+        self.master = self.io_loop.asyncio_loop.run_until_complete(make_master())
+        return app.Application(self.master, None)  # xsrf_cookies stays enabled
+
+    def test_bearer_token_is_exempt_from_xsrf(self):
+        web_password = self.master.addons.get("webauth")._password
+        resp = self.fetch(
+            "/options",
+            method="PUT",
+            body=json.dumps({"anticache": True}),
+            headers={
+                "Cookie": "",
+                "Authorization": f"Bearer {web_password}",
+                "Content-Type": "application/json",
+            },
+        )
+        assert resp.code == 200
+
+    def test_cookie_auth_still_requires_xsrf(self):
+        auth_cookie = create_signed_value(
+            secret=self._app.settings["cookie_secret"],
+            name=self._app.settings["auth_cookie_name"](),
+            value=app.AuthRequestHandler.AUTH_COOKIE_VALUE,
+        ).decode()
+        resp = self.fetch(
+            "/options",
+            method="PUT",
+            body=json.dumps({"anticache": True}),
+            headers={
+                "Cookie": f"{self._app.settings['auth_cookie_name']()}={auth_cookie}",
+                "Content-Type": "application/json",
+            },
+        )
+        assert resp.code == 403

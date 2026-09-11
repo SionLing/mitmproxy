@@ -625,6 +625,39 @@ def save(opts: OptManager, path: Path | str, defaults: bool = False) -> None:
         serialize(opts, f, data, defaults)
 
 
+def save_keys(opts: OptManager, path: Path | str, keys: Iterable[str]) -> None:
+    """
+    Persist only the given options to path, modifying the file in-place.
+
+    Unlike save(), options that were set elsewhere (e.g. on the command line)
+    but are not part of `keys` are not written to the file. Options in `keys`
+    that currently hold their default value are removed from the file.
+
+    Raises OptionsError if the existing data is corrupt.
+    """
+    path = Path(path).expanduser()
+    if path.exists() and path.is_file():
+        try:
+            text = path.read_text(encoding="utf8")
+        except UnicodeDecodeError as e:
+            raise exceptions.OptionsError(f"Error trying to modify {path}: {e}")
+    else:
+        text = ""
+
+    data = parse(text)
+    for k in keys:
+        if k not in opts._options:
+            continue
+        if opts.has_changed(k):
+            data[k] = getattr(opts, k)
+        else:
+            data.pop(k, None)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf8") as f:
+        ruamel.yaml.YAML().dump(data, f)
+
+
 def relative_path(script_path: Path | str, *, relative_to: Path | str) -> Path:
     """
     Make relative paths found in config files relative to said config file,
